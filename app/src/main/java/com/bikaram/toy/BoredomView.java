@@ -1,573 +1,1484 @@
 package com.bikaram.toy;
 
+import android.annotation.SuppressLint;
 import android.content.Context;
 import android.graphics.*;
-import android.hardware.Sensor;
-import android.hardware.SensorEvent;
-import android.hardware.SensorEventListener;
-import android.hardware.SensorManager;
+import android.hardware.*;
 import android.media.AudioManager;
 import android.media.ToneGenerator;
-import android.os.Build;
-import android.os.VibrationEffect;
-import android.os.Vibrator;
+import android.os.*;
+import android.view.Choreographer;
 import android.view.MotionEvent;
 import android.view.View;
+import java.text.DateFormat;
+import java.util.*;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Locale;
-import java.util.Random;
+@SuppressLint("ViewConstructor") // Programmatic view requires a non-null Activity host.
+public final class BoredomView extends View
+    implements SensorEventListener, Choreographer.FrameCallback {
+  interface Host {
+    void shareSnapshot(String text);
+  }
 
-public final class BoredomView extends View implements SensorEventListener {
-    interface Host { void shareSnapshot(String text); }
+  private enum Screen {
+    HOME,
+    GAME,
+    SPEED,
+    RESULTS,
+    RECORDS,
+    SETTINGS,
+    ACHIEVEMENTS,
+    SKINS,
+    MODES,
+    ABOUT,
+    CHALLENGE
+  }
 
-    private static final String[] MODES = {"NORMAL", "ZEN", "RAGE", "OFFICE", "TURBO", "GRAVITY"};
-    private static final String[] MODE_FA = {"معمولی", "ذن", "اعصاب‌خورد", "اداری", "توربو", "جاذبه"};
-    private static final String[] SKINS = {"CLASSIC", "FOOTBALL", "COCONUT", "DISCO", "WATERMELON", "MOON", "PINGPONG"};
-    private static final String[] SKIN_FA = {"کلاسیک", "فوتبال", "نارگیل", "دیسکو", "هندوانه", "ماه", "پینگ‌پنگ"};
-    private static final long[] ACHIEVEMENTS = {10, 100, 1000, 10000, 100000};
-    private static final String[] ACHIEVEMENT_NAMES = {"اولین دست‌کاری", "کار و زندگی نداری؟", "برو یه کاری پیدا کن", "استاد اعظم بیکاری", "این دیگه نگران‌کننده‌ست"};
+  private static final int BG_TOP = Color.rgb(251, 248, 240),
+      BG_BOTTOM = Color.rgb(232, 225, 211),
+      INK = Color.rgb(29, 29, 27),
+      MUTED = Color.rgb(105, 100, 91),
+      ACCENT = Color.rgb(246, 195, 61);
+  private static final float MAX_CARRY_SECONDS = 15f;
+  private final Host host;
+  private final GamePreferences prefs;
+  private final PhysicsBall left = new PhysicsBall(-.05f), right = new PhysicsBall(.05f);
+  private final SpeedMissionEngine missionEngine = new SpeedMissionEngine();
+  private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG),
+      text = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.SUBPIXEL_TEXT_FLAG);
+  private final RectF rect = new RectF();
+  private final Path path = new Path();
+  private final Random random = new Random();
+  private final List<Particle> particles = new ArrayList<>(96);
+  private final SensorManager sensorManager;
+  private final Sensor accelerometer;
+  private final Vibrator vibrator;
+  private ToneGenerator tone;
+  private Screen screen = Screen.HOME, previousScreen = Screen.HOME;
+  private boolean hostActive, framePosted, sensorRegistered;
+  private long lastFrameNanos, lastTapMs, lastSoundMs;
+  private float density, scaledDensity, tiltX, shake, toastSeconds;
+  private int streak, selectedRecordFilter;
+  private String toast = "";
+  private SpeedMission mission;
+  private int missionIndex,
+      completedMissions,
+      speedTaps,
+      speedBestStreak,
+      speedStreak,
+      speedLastSide = -1,
+      highestDifficulty;
+  private float maxCarry, carrySeconds, timeLeft, countdown, successPause, sessionSeconds;
+  private GameRecord lastResult;
+  private long classicStartedAt;
+  private int classicTaps;
+  private DailyChallenge activeChallenge;
+  private int challengeProgress, challengeLastSide = -1;
+  private float challengeTimeLeft;
+  private boolean duelActive;
+  private float duelTimeLeft;
+  private int duelLeft, duelRight;
+  private LinearGradient backgroundGradient;
+  private RadialGradient skinGradient;
+  private String cachedSkin = "";
+  private float cachedRadius;
 
-    private final Host host;
-    private final GameState state;
-    private final PhysicsBall left = new PhysicsBall(-0.08f);
-    private final PhysicsBall right = new PhysicsBall(0.08f);
-    private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Random random = new Random();
-    private final SensorManager sensorManager;
-    private final Sensor accelerometer;
-    private final Vibrator vibrator;
-    private ToneGenerator tone;
-    private DailyChallenge challenge = DailyChallenge.today();
+  private static final class Particle {
+    float x, y, vx, vy, life;
+    int color;
+  }
 
-    private float density;
-    private long lastFrameNanos;
-    private long lastTapMs;
-    private int streak;
-    private float tiltX;
-    private float shake;
-    private int flashFrames;
-    private boolean menuModes;
-    private boolean menuSkins;
-    private boolean statsOpen;
-    private boolean challengeOpen;
-    private String toast = "";
-    private long toastUntil;
-
-    private boolean challengeRunning;
-    private long challengeStarted;
-    private int challengeProgress;
-    private boolean challengeFailed;
-    private int lastChallengeSide = -1;
-
-    private boolean duelActive;
-    private long duelStarted;
-    private int duelLeft;
-    private int duelRight;
-    private String duelResult = "";
-    private long duelResultUntil;
-
-    private final List<Particle> particles = new ArrayList<>();
-
-    private static final class Particle {
-        float x, y, vx, vy, life;
-        int color;
+  BoredomView(Context context, Host host) {
+    super(context);
+    this.host = host;
+    prefs = new GamePreferences(context);
+    density = getResources().getDisplayMetrics().density;
+    scaledDensity = density * getResources().getConfiguration().fontScale;
+    sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
+    accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
+    vibrator = context.getSystemService(Vibrator.class);
+    try {
+      tone = new ToneGenerator(AudioManager.STREAM_MUSIC, 28);
+    } catch (RuntimeException ignored) {
     }
+    text.setTypeface(Typeface.create("sans", Typeface.BOLD));
+    setFocusable(true);
+  }
 
-    BoredomView(Context context, Host host) {
-        super(context);
-        this.host = host;
-        state = new GameState(context);
-        density = getResources().getDisplayMetrics().density;
-        sensorManager = (SensorManager) context.getSystemService(Context.SENSOR_SERVICE);
-        accelerometer = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER);
-        vibrator = (Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE);
-        try { tone = new ToneGenerator(AudioManager.STREAM_MUSIC, 35); } catch (Exception ignored) {}
-        text.setTypeface(Typeface.create("sans", Typeface.BOLD));
-        setLayerType(View.LAYER_TYPE_SOFTWARE, null);
-        postInvalidateOnAnimation();
+  void onHostResume() {
+    hostActive = true;
+    lastFrameNanos = 0;
+    updateSensorRegistration();
+    requestFrame();
+  }
+
+  void onHostPause() {
+    hostActive = false;
+    removeFrame();
+    unregisterSensor();
+    prefs.flush();
+  }
+
+  void release() {
+    onHostPause();
+    if (tone != null) {
+      tone.release();
+      tone = null;
     }
+  }
 
-    void startSensors() {
-        if (accelerometer != null) sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME);
+  boolean navigateBack() {
+    if (screen == Screen.HOME) return false;
+    if (screen == Screen.GAME) finishClassicRun();
+    if (screen == Screen.RESULTS || screen == Screen.GAME || screen == Screen.SPEED)
+      screen = Screen.HOME;
+    else screen = previousScreen == Screen.GAME ? Screen.GAME : Screen.HOME;
+    lastFrameNanos = 0;
+    updateSensorRegistration();
+    invalidate();
+    requestFrame();
+    return true;
+  }
+
+  @Override
+  protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+    backgroundGradient = new LinearGradient(0, 0, 0, h, BG_TOP, BG_BOTTOM, Shader.TileMode.CLAMP);
+    float radius = Math.min(w * .145f, dp(70)),
+        anchorY = Math.max(dp(112), h * .19f),
+        rope = Math.min(h * .285f, dp(260));
+    left.layout(w * .41f, anchorY, rope, radius);
+    right.layout(w * .59f, anchorY + dp(3), rope * 1.015f, radius);
+    cachedRadius = 0;
+  }
+
+  @Override
+  public void doFrame(long nanos) {
+    framePosted = false;
+    if (!hostActive) return;
+    float dt =
+        lastFrameNanos == 0 ? 1f / 60f : Math.min(.034f, (nanos - lastFrameNanos) / 1_000_000_000f);
+    lastFrameNanos = nanos;
+    boolean moving = update(dt);
+    invalidate();
+    if (moving) requestFrame();
+    else lastFrameNanos = 0;
+  }
+
+  private boolean update(float dt) {
+    boolean gameplay = screen == Screen.GAME || screen == Screen.SPEED;
+    if (gameplay) updatePhysics(dt);
+    if (screen == Screen.SPEED) updateSpeed(dt);
+    if (screen == Screen.GAME && activeChallenge != null && activeChallenge.durationMs > 0) {
+      challengeTimeLeft -= dt;
+      if (challengeTimeLeft <= 0) {
+        activeChallenge = null;
+        showToast("Daily challenge timed out", 1.6f);
+      }
     }
-
-    void stopSensors() { sensorManager.unregisterListener(this); }
-
-    void release() { if (tone != null) tone.release(); }
-
-    @Override protected void onSizeChanged(int w, int h, int oldw, int oldh) {
-        float r = Math.min(w * 0.155f, dp(74));
-        float anchorY = h * 0.22f;
-        float rope = h * 0.25f;
-        left.layout(w * 0.42f, anchorY, rope, r);
-        right.layout(w * 0.58f, anchorY + dp(4), rope * 1.02f, r);
+    if (screen == Screen.GAME && duelActive) {
+      duelTimeLeft -= dt;
+      if (duelTimeLeft <= 0) finishDuel();
     }
-
-    @Override protected void onDraw(Canvas canvas) {
-        long now = System.nanoTime();
-        float dt = lastFrameNanos == 0 ? 1f / 60f : Math.min(0.033f, (now - lastFrameNanos) / 1_000_000_000f);
-        lastFrameNanos = now;
-        update(dt);
-
-        canvas.save();
-        if (shake > 0.2f) canvas.translate((random.nextFloat() - .5f) * shake, (random.nextFloat() - .5f) * shake);
-        drawBackground(canvas);
-        drawHeader(canvas);
-        drawPlayground(canvas);
-        drawBalls(canvas);
-        drawParticles(canvas);
-        drawBottomBar(canvas);
-        drawOverlays(canvas);
-        canvas.restore();
-
-        postInvalidateOnAnimation();
+    shake *= Math.pow(.86f, dt * 60f);
+    toastSeconds = Math.max(0, toastSeconds - dt);
+    for (int i = particles.size() - 1; i >= 0; i--) {
+      Particle q = particles.get(i);
+      q.vy += dp(290) * dt;
+      q.x += q.vx * dt;
+      q.y += q.vy * dt;
+      q.life -= dt;
+      if (q.life <= 0) particles.remove(i);
     }
+    boolean moving = gameplay && !(left.isResting() && right.isResting());
+    if (moving && Math.abs(left.angularVelocity) + Math.abs(right.angularVelocity) < .024f) {
+      left.settle();
+      right.settle();
+      moving = false;
+    }
+    return moving
+        || screen == Screen.SPEED
+        || activeChallenge != null
+        || duelActive
+        || !particles.isEmpty()
+        || toastSeconds > 0
+        || shake > .2f;
+  }
 
-    private void update(float dt) {
-        float gravity = dp(780);
-        float damping = 0.987f;
-        float impulseScale = 1f;
-        switch (state.mode) {
-            case "ZEN": gravity *= .65f; damping = .965f; impulseScale = .65f; break;
-            case "RAGE": gravity *= 1.1f; damping = .993f; impulseScale = 1.55f; break;
-            case "OFFICE": gravity *= .85f; damping = .98f; impulseScale = .75f; break;
-            case "TURBO": gravity *= 1.35f; damping = .996f; impulseScale = 2.05f; break;
-            case "GRAVITY": gravity *= .82f; damping = .99f; impulseScale = 1.05f; break;
+  private void updatePhysics(float dt) {
+    GameModeConfig mode = GameModeConfig.forId(prefs.mode());
+    float intensity =
+        prefs.reducedMotion()
+            ? .72f
+            : "CALM".equals(prefs.intensity())
+                ? .82f
+                : "WILD".equals(prefs.intensity()) ? 1.13f : 1f;
+    left.setSoftLimit(mode.motionLimit);
+    right.setSoftLimit(mode.motionLimit);
+    float horizontal = prefs.deviceGravity() ? tiltX * dp(mode.sensorStrength) : 0;
+    left.step(dt, dp(mode.gravity), mode.damping, horizontal);
+    right.step(dt, dp(mode.gravity), mode.damping, horizontal);
+    resolveCollision(mode.collisionStrength * intensity);
+  }
+
+  private void resolveCollision(float strength) {
+    float dx = right.x - left.x,
+        dy = right.y - left.y,
+        d2 = dx * dx + dy * dy,
+        min = left.radius + right.radius - dp(7);
+    if (d2 >= min * min || d2 < 1) return;
+    float overlap = (min - (float) Math.sqrt(d2)) / min, old = left.angularVelocity;
+    left.angularVelocity = right.angularVelocity * .70f - overlap * strength;
+    right.angularVelocity = old * .70f + overlap * strength;
+    if (overlap > .035f) {
+      playCollision();
+      if (overlap > .10f) haptic(2);
+    }
+  }
+
+  private void updateSpeed(float dt) {
+    sessionSeconds += dt;
+    if (countdown > 0) {
+      countdown = Math.max(0, countdown - dt);
+      return;
+    }
+    if (successPause > 0) {
+      successPause -= dt;
+      if (successPause <= 0) beginMission();
+      return;
+    }
+    timeLeft -= dt;
+    if (timeLeft <= 0) finishSpeedSession();
+  }
+
+  private void requestFrame() {
+    if (hostActive && !framePosted) {
+      framePosted = true;
+      Choreographer.getInstance().postFrameCallback(this);
+    }
+  }
+
+  private void removeFrame() {
+    if (framePosted) Choreographer.getInstance().removeFrameCallback(this);
+    framePosted = false;
+    lastFrameNanos = 0;
+  }
+
+  @Override
+  protected void onDraw(Canvas c) {
+    super.onDraw(c);
+    paint.setShader(backgroundGradient);
+    c.drawRect(0, 0, getWidth(), getHeight(), paint);
+    paint.setShader(null);
+    boolean shifted = shake > .2f && !prefs.reducedMotion();
+    if (shifted) {
+      c.save();
+      c.translate((random.nextFloat() - .5f) * shake, (random.nextFloat() - .5f) * shake);
+    }
+    switch (screen) {
+      case HOME:
+        drawHome(c);
+        break;
+      case GAME:
+        drawGame(c, false);
+        break;
+      case SPEED:
+        drawGame(c, true);
+        break;
+      case RESULTS:
+        drawResults(c);
+        break;
+      case RECORDS:
+        drawRecords(c);
+        break;
+      case SETTINGS:
+        drawSettings(c);
+        break;
+      case ACHIEVEMENTS:
+        drawAchievements(c);
+        break;
+      case SKINS:
+        drawChoices(c, false);
+        break;
+      case MODES:
+        drawChoices(c, true);
+        break;
+      case ABOUT:
+        drawAbout(c);
+        break;
+      case CHALLENGE:
+        drawChallenge(c);
+        break;
+    }
+    drawParticles(c);
+    if (toastSeconds > 0) drawToast(c);
+    if (shifted) c.restore();
+  }
+
+  private void drawHome(Canvas c) {
+    label(c, "BIKARAM", getWidth() / 2f, dp(76), 12, MUTED, Paint.Align.CENTER);
+    label(c, "بیکارم!", getWidth() / 2f, dp(126), 36, INK, Paint.Align.CENTER);
+    label(c, "A premium waste of time", getWidth() / 2f, dp(154), 13, MUTED, Paint.Align.CENTER);
+    drawMiniBalls(c, getWidth() / 2f, dp(225));
+    button(c, dp(28), dp(292), getWidth() - dp(28), dp(354), "START", true);
+    button(c, dp(28), dp(368), getWidth() - dp(28), dp(424), "⚡  SPEED MODE", false);
+    String[] rows = {
+      "Game Modes", "Challenges", "Records", "Achievements", "Skins", "Settings", "About"
+    };
+    float y = dp(442), row = Math.min(dp(46), (getHeight() - y - dp(14)) / rows.length);
+    for (String name : rows) {
+      label(c, name, dp(38), y + row * .62f, 14, INK, Paint.Align.LEFT);
+      label(c, "›", getWidth() - dp(38), y + row * .62f, 21, MUTED, Paint.Align.RIGHT);
+      paint.setColor(Color.argb(25, 0, 0, 0));
+      c.drawRect(dp(36), y + row - 1, getWidth() - dp(36), y + row, paint);
+      y += row;
+    }
+  }
+
+  private void drawMiniBalls(Canvas c, float x, float y) {
+    paint.setStrokeWidth(dp(4));
+    paint.setColor(Color.rgb(69, 60, 52));
+    c.drawLine(x - dp(27), y - dp(48), x - dp(22), y - dp(12), paint);
+    c.drawLine(x + dp(27), y - dp(48), x + dp(22), y - dp(12), paint);
+    paint.setColor(Color.rgb(193, 139, 106));
+    c.drawOval(x - dp(43), y - dp(16), x - dp(3), y + dp(35), paint);
+    paint.setColor(Color.rgb(178, 120, 92));
+    c.drawOval(x + dp(3), y - dp(16), x + dp(43), y + dp(35), paint);
+  }
+
+  private void drawGame(Canvas c, boolean speed) {
+    label(
+        c,
+        speed ? "SPEED MODE" : GameModeConfig.displayName(prefs.mode()).toUpperCase(Locale.US),
+        dp(18),
+        dp(42),
+        12,
+        MUTED,
+        Paint.Align.LEFT);
+    label(
+        c,
+        speed
+            ? String.valueOf(completedMissions)
+            : String.format(Locale.US, "%,d", prefs.todayTaps()),
+        getWidth() / 2f,
+        dp(43),
+        23,
+        INK,
+        Paint.Align.CENTER);
+    label(c, "Ⅱ", getWidth() - dp(20), dp(43), 19, INK, Paint.Align.RIGHT);
+    if (speed) drawSpeedHud(c);
+    else {
+      label(c, "TAPS TODAY", getWidth() / 2f, dp(61), 9, MUTED, Paint.Align.CENTER);
+      progress(
+          c,
+          dp(18),
+          dp(72),
+          getWidth() - dp(18),
+          dp(77),
+          Math.min(1f, prefs.todayTaps() / 500f),
+          ACCENT);
+      if (activeChallenge != null) {
+        String timer =
+            activeChallenge.durationMs > 0
+                ? String.format(Locale.US, "  %.1fs", Math.max(0, challengeTimeLeft))
+                : "";
+        label(
+            c,
+            activeChallenge.title + "  " + challengeProgress + "/" + activeChallenge.target + timer,
+            getWidth() / 2f,
+            dp(101),
+            11,
+            INK,
+            Paint.Align.CENTER);
+      } else if (duelActive)
+        label(
+            c,
+            String.format(
+                Locale.US,
+                "DUEL  L %d  •  R %d   %.1fs",
+                duelLeft,
+                duelRight,
+                Math.max(0, duelTimeLeft)),
+            getWidth() / 2f,
+            dp(101),
+            12,
+            INK,
+            Paint.Align.CENTER);
+    }
+    drawRig(c);
+    drawBalls(c);
+    if (!speed)
+      label(
+          c, boredomLabel(), getWidth() / 2f, getHeight() - dp(28), 12, MUTED, Paint.Align.CENTER);
+    if (speed && countdown > 0) {
+      String value = countdown > 1 ? String.valueOf((int) Math.ceil(countdown - 1)) : "GO";
+      overlay(c, value, "Get both thumbs ready");
+    } else if (speed && successPause > 0)
+      overlay(c, "SUCCESS", String.format(Locale.US, "+%.1fs carry", carrySeconds));
+  }
+
+  private void drawSpeedHud(Canvas c) {
+    if (mission == null) return;
+    label(
+        c,
+        "MISSION #" + (missionIndex + 1),
+        getWidth() / 2f,
+        dp(86),
+        11,
+        MUTED,
+        Paint.Align.CENTER);
+    label(c, mission.title, getWidth() / 2f, dp(111), 17, INK, Paint.Align.CENTER);
+    int target = mission.targetForProgress();
+    label(
+        c,
+        Math.min(target, missionEngine.progress()) + " / " + target,
+        getWidth() / 2f,
+        dp(139),
+        14,
+        INK,
+        Paint.Align.CENTER);
+    progress(
+        c,
+        dp(28),
+        dp(151),
+        getWidth() - dp(28),
+        dp(158),
+        target == 0 ? 0 : Math.min(1f, missionEngine.progress() / (float) target),
+        ACCENT);
+    int color = timeLeft < 3 && countdown <= 0 ? Color.rgb(202, 48, 48) : INK;
+    label(
+        c,
+        String.format(Locale.US, "%.1f s", Math.max(0, timeLeft)),
+        dp(24),
+        dp(184),
+        21,
+        color,
+        Paint.Align.LEFT);
+    label(
+        c,
+        String.format(Locale.US, "carry +%.1f", carrySeconds),
+        getWidth() - dp(24),
+        dp(181),
+        11,
+        MUTED,
+        Paint.Align.RIGHT);
+  }
+
+  private void drawRig(Canvas c) {
+    paint.setColor(Color.rgb(61, 56, 50));
+    paint.setStrokeWidth(dp(7));
+    paint.setStrokeCap(Paint.Cap.ROUND);
+    c.drawLine(getWidth() * .27f, left.anchorY, getWidth() * .73f, left.anchorY, paint);
+    paint.setColor(Color.argb(35, 0, 0, 0));
+    c.drawOval(getWidth() * .22f, getHeight() * .67f, getWidth() * .78f, getHeight() * .72f, paint);
+  }
+
+  private void drawBalls(Canvas c) {
+    drawBall(c, left, true);
+    drawBall(c, right, false);
+  }
+
+  private void drawBall(Canvas c, PhysicsBall b, boolean isLeft) {
+    paint.setStyle(Paint.Style.STROKE);
+    paint.setStrokeWidth(dp(7));
+    paint.setColor(Color.rgb(74, 61, 53));
+    c.drawLine(b.anchorX, b.anchorY, b.x, b.y - b.radius * .52f, paint);
+    paint.setStyle(Paint.Style.FILL);
+    c.save();
+    c.translate(b.x, b.y);
+    c.rotate((float) Math.toDegrees(b.angle) * .28f);
+    float rx = b.radius * .90f, ry = b.radius * 1.14f;
+    ensureSkinGradient(b.radius);
+    paint.setShader(skinGradient);
+    paint.setShadowLayer(dp(10), dp(2), dp(7), Color.argb(48, 0, 0, 0));
+    c.drawOval(-rx, -ry, rx, ry, paint);
+    paint.clearShadowLayer();
+    paint.setShader(null);
+    drawSkinDetails(c, rx, ry, isLeft);
+    c.restore();
+  }
+
+  private void ensureSkinGradient(float radius) {
+    String skin = prefs.skin();
+    if (skin.equals(cachedSkin) && Math.abs(radius - cachedRadius) < .5f) return;
+    cachedSkin = skin;
+    cachedRadius = radius;
+    int base = Color.rgb(188, 132, 100),
+        dark = Color.rgb(103, 65, 51),
+        light = Color.rgb(239, 192, 151);
+    switch (skin) {
+      case "COCONUT":
+        base = Color.rgb(126, 82, 48);
+        dark = Color.rgb(62, 37, 22);
+        light = Color.rgb(181, 128, 76);
+        break;
+      case "WATERMELON":
+        base = Color.rgb(68, 157, 76);
+        dark = Color.rgb(16, 78, 37);
+        light = Color.rgb(130, 211, 113);
+        break;
+      case "MOON":
+        base = Color.rgb(183, 186, 184);
+        dark = Color.rgb(85, 91, 95);
+        light = Color.rgb(235, 237, 230);
+        break;
+      case "PINGPONG":
+        base = Color.rgb(245, 242, 228);
+        dark = Color.rgb(167, 161, 143);
+        light = Color.WHITE;
+        break;
+      case "FOOTBALL":
+        base = Color.rgb(232, 230, 219);
+        dark = Color.rgb(72, 72, 69);
+        light = Color.WHITE;
+        break;
+      case "DISCO":
+        base = Color.rgb(137, 157, 181);
+        dark = Color.rgb(44, 51, 70);
+        light = Color.rgb(246, 251, 255);
+        break;
+    }
+    skinGradient =
+        new RadialGradient(
+            -radius * .28f,
+            -radius * .42f,
+            radius * 1.85f,
+            new int[] {light, base, dark},
+            new float[] {0, .47f, 1},
+            Shader.TileMode.CLAMP);
+  }
+
+  private void drawSkinDetails(Canvas c, float rx, float ry, boolean leftSide) {
+    String skin = prefs.skin();
+    if ("FOOTBALL".equals(skin)) {
+      paint.setColor(Color.rgb(38, 38, 38));
+      path.reset();
+      for (int i = 0; i < 5; i++) {
+        double a = -Math.PI / 2 + i * Math.PI * 2 / 5;
+        float x = (float) Math.cos(a) * rx * .25f, y = (float) Math.sin(a) * ry * .22f;
+        if (i == 0) path.moveTo(x, y);
+        else path.lineTo(x, y);
+      }
+      path.close();
+      c.drawPath(path, paint);
+      paint.setStyle(Paint.Style.STROKE);
+      paint.setStrokeWidth(dp(2));
+      for (int i = 0; i < 5; i++) {
+        double a = i * Math.PI * 2 / 5;
+        c.drawLine(
+            (float) Math.cos(a) * rx * .26f,
+            (float) Math.sin(a) * ry * .23f,
+            (float) Math.cos(a) * rx * .78f,
+            (float) Math.sin(a) * ry * .70f,
+            paint);
+      }
+      paint.setStyle(Paint.Style.FILL);
+    } else if ("WATERMELON".equals(skin)) {
+      paint.setColor(Color.rgb(28, 101, 48));
+      paint.setStyle(Paint.Style.STROKE);
+      paint.setStrokeWidth(dp(3));
+      for (int i = -2; i <= 2; i++)
+        c.drawArc(-rx + i * dp(4), -ry, rx - i * dp(4), ry, 78, 204, false, paint);
+      paint.setStyle(Paint.Style.FILL);
+    } else if ("DISCO".equals(skin)) {
+      paint.setColor(Color.argb(115, 255, 255, 255));
+      paint.setStrokeWidth(dp(1.3f));
+      for (float y = -ry + dp(10); y < ry; y += dp(11)) c.drawLine(-rx, y, rx, y, paint);
+      for (float x = -rx + dp(10); x < rx; x += dp(11)) c.drawLine(x, -ry, x, ry, paint);
+      paint.setColor(Color.WHITE);
+      c.drawCircle(-rx * .28f, -ry * .35f, dp(3), paint);
+    } else if ("MOON".equals(skin)) {
+      paint.setColor(Color.argb(42, 20, 25, 28));
+      c.drawCircle(-rx * .23f, ry * .2f, rx * .13f, paint);
+      c.drawCircle(rx * .25f, -ry * .2f, rx * .09f, paint);
+      c.drawCircle(rx * .15f, ry * .48f, rx * .06f, paint);
+    } else if ("COCONUT".equals(skin)) {
+      paint.setColor(Color.argb(105, 47, 27, 14));
+      paint.setStrokeWidth(dp(1));
+      for (int i = -3; i <= 3; i++)
+        c.drawLine(i * rx * .2f, -ry * .82f, (i - 1) * rx * .15f, ry * .82f, paint);
+    } else if ("PINGPONG".equals(skin)) {
+      paint.setColor(Color.rgb(227, 91, 40));
+      paint.setStyle(Paint.Style.STROKE);
+      paint.setStrokeWidth(dp(2));
+      c.drawArc(-rx * .38f, -ry * .2f, rx * .38f, ry * .2f, 190, 140, false, paint);
+      paint.setStyle(Paint.Style.FILL);
+    } else if ("CLASSIC".equals(skin)) {
+      paint.setColor(Color.argb(72, 80, 45, 34));
+      paint.setStyle(Paint.Style.STROKE);
+      paint.setStrokeWidth(dp(1));
+      for (int i = 0; i < 3; i++)
+        c.drawArc(
+            -rx * .52f,
+            ry * (-.02f + i * .13f),
+            rx * .52f,
+            ry * (.08f + i * .13f),
+            20,
+            140,
+            false,
+            paint);
+      paint.setColor(Color.rgb(66, 45, 36));
+      for (int i = 0; i < 7; i++) {
+        float side = ((i + (leftSide ? 0 : 1)) % 2 == 0 ? -1 : 1),
+            x = side * rx * (.25f + .05f * (i % 2)),
+            y = -ry * .25f + i * ry * .11f;
+        c.drawLine(x, y, x + side * dp(3), y - dp(5 + i % 3), paint);
+      }
+      paint.setStyle(Paint.Style.FILL);
+    }
+    paint.setColor(Color.argb(55, 255, 255, 255));
+    c.drawOval(-rx * .48f, -ry * .64f, rx * .03f, -ry * .18f, paint);
+  }
+
+  private void drawParticles(Canvas c) {
+    for (Particle q : particles) {
+      paint.setColor(q.color);
+      paint.setAlpha((int) (255 * Math.min(1, q.life)));
+      c.drawCircle(q.x, q.y, dp(3.5f), paint);
+    }
+    paint.setAlpha(255);
+  }
+
+  private void drawSettings(Canvas c) {
+    screenTitle(c, "Settings");
+    setting(c, 0, "Sound Effects", prefs.sound());
+    setting(c, 1, "Haptic Feedback", prefs.haptics());
+    setting(c, 2, "Motion / Device Gravity", prefs.deviceGravity());
+    setting(c, 3, "Reduced Motion", prefs.reducedMotion());
+    label(c, "ANIMATION INTENSITY", dp(28), dp(365), 10, MUTED, Paint.Align.LEFT);
+    String[] levels = {"CALM", "NORMAL", "WILD"};
+    for (int i = 0; i < 3; i++)
+      chip(
+          c,
+          dp(28) + i * (getWidth() - dp(56)) / 3f,
+          dp(380),
+          dp(28) + (i + 1) * (getWidth() - dp(56)) / 3f - dp(6),
+          dp(424),
+          levels[i],
+          levels[i].equals(prefs.intensity()));
+    button(c, dp(28), dp(458), getWidth() - dp(28), dp(510), "Reset statistics", false);
+    button(c, dp(28), dp(522), getWidth() - dp(28), dp(574), "Reset achievements", false);
+    label(c, "Version 1.1.0", getWidth() / 2f, getHeight() - dp(28), 11, MUTED, Paint.Align.CENTER);
+  }
+
+  private void setting(Canvas c, int index, String name, boolean value) {
+    float top = dp(105) + index * dp(59);
+    label(c, name, dp(28), top + dp(29), 15, INK, Paint.Align.LEFT);
+    rect.set(getWidth() - dp(76), top + dp(10), getWidth() - dp(28), top + dp(36));
+    paint.setColor(value ? INK : Color.rgb(204, 199, 190));
+    c.drawRoundRect(rect, dp(15), dp(15), paint);
+    paint.setColor(Color.WHITE);
+    c.drawCircle(value ? rect.right - dp(13) : rect.left + dp(13), rect.centerY(), dp(10), paint);
+  }
+
+  private void drawRecords(Canvas c) {
+    screenTitle(c, "Records");
+    String[] filters = {"ALL", "CLASSIC", "SPEED", "CHALLENGE"};
+    float width = (getWidth() - dp(40)) / 4f;
+    for (int i = 0; i < 4; i++)
+      chip(
+          c,
+          dp(20) + i * width,
+          dp(91),
+          dp(20) + (i + 1) * width - dp(4),
+          dp(130),
+          filters[i],
+          selectedRecordFilter == i);
+    List<GameRecord> records = prefs.records();
+    float y = dp(150);
+    int shown = 0;
+    for (GameRecord record : records) {
+      if (selectedRecordFilter == 1 && !"CLASSIC".equals(record.mode)) continue;
+      if (selectedRecordFilter == 2 && !"SPEED".equals(record.mode)) continue;
+      if (selectedRecordFilter == 3 && !"CHALLENGE".equals(record.mode)) continue;
+      if (shown++ >= 5) break;
+      rect.set(dp(20), y, getWidth() - dp(20), y + dp(88));
+      paint.setColor(Color.argb(150, 255, 255, 255));
+      c.drawRoundRect(rect, dp(17), dp(17), paint);
+      paint.setColor(skinPreviewColor(record.skinId));
+      c.drawCircle(dp(51), y + dp(44), dp(19), paint);
+      String title =
+          "SPEED".equals(record.mode)
+              ? record.missions + " missions"
+              : String.format(Locale.US, "%,d taps", record.taps);
+      label(c, title, dp(82), y + dp(31), 16, INK, Paint.Align.LEFT);
+      label(
+          c,
+          GamePreferences.skinName(record.skinId) + "  •  " + formatDuration(record.durationMs),
+          dp(82),
+          y + dp(54),
+          11,
+          MUTED,
+          Paint.Align.LEFT);
+      label(
+          c,
+          DateFormat.getDateInstance(DateFormat.MEDIUM).format(new Date(record.timestamp)),
+          dp(82),
+          y + dp(72),
+          10,
+          MUTED,
+          Paint.Align.LEFT);
+      if ("SPEED".equals(record.mode) && record.missions == prefs.bestSpeed())
+        label(
+            c,
+            "BEST",
+            getWidth() - dp(34),
+            y + dp(31),
+            10,
+            Color.rgb(150, 94, 0),
+            Paint.Align.RIGHT);
+      y += dp(99);
+    }
+    if (shown == 0)
+      label(
+          c,
+          "No runs yet. Your thumbs are suspiciously productive.",
+          getWidth() / 2f,
+          dp(220),
+          13,
+          MUTED,
+          Paint.Align.CENTER);
+  }
+
+  private void drawAchievements(Canvas c) {
+    screenTitle(c, "Achievements");
+    String[]
+        names =
+            {
+              "First ten",
+              "Century of boredom",
+              "One thousand taps",
+              "Ten thousand taps",
+              "Legendary 100K",
+              "First Mission",
+              "Five Missions",
+              "Ten Missions",
+              "Twenty Missions",
+              "Perfect Alternation",
+              "Carry Master"
+            },
+        ids =
+            {
+              "10",
+              "100",
+              "1000",
+              "10000",
+              "100000",
+              "speed_first",
+              "speed_5",
+              "speed_10",
+              "speed_20",
+              "perfect_alternation",
+              "carry_master"
+            };
+    float y = dp(98);
+    for (int i = 0; i < names.length; i++) {
+      boolean unlocked = prefs.achievement(ids[i]);
+      paint.setColor(unlocked ? ACCENT : Color.rgb(210, 205, 196));
+      c.drawCircle(dp(42), y + dp(16), dp(13), paint);
+      label(
+          c,
+          unlocked ? "✓" : "·",
+          dp(42),
+          y + dp(21),
+          12,
+          unlocked ? INK : MUTED,
+          Paint.Align.CENTER);
+      label(c, names[i], dp(70), y + dp(21), 13, unlocked ? INK : MUTED, Paint.Align.LEFT);
+      y += dp(44);
+    }
+  }
+
+  private void drawChoices(Canvas c, boolean modes) {
+    screenTitle(c, modes ? "Game Modes" : "Skins");
+    String[] ids = modes ? GameModeConfig.IDS : GamePreferences.SKIN_IDS,
+        names = modes ? GameModeConfig.NAMES : GamePreferences.SKIN_NAMES;
+    String current = modes ? prefs.mode() : prefs.skin();
+    float y = dp(102);
+    for (int i = 0; i < ids.length; i++) {
+      rect.set(dp(24), y, getWidth() - dp(24), y + dp(56));
+      paint.setColor(
+          ids[i].equals(current) ? Color.rgb(255, 239, 189) : Color.argb(145, 255, 255, 255));
+      c.drawRoundRect(rect, dp(16), dp(16), paint);
+      if (!modes) {
+        paint.setColor(skinPreviewColor(ids[i]));
+        c.drawCircle(dp(54), y + dp(28), dp(16), paint);
+      }
+      label(c, names[i], modes ? dp(42) : dp(84), y + dp(34), 15, INK, Paint.Align.LEFT);
+      y += dp(66);
+    }
+  }
+
+  private void drawAbout(Canvas c) {
+    screenTitle(c, "About");
+    label(c, "بیکارم!", getWidth() / 2f, dp(146), 34, INK, Paint.Align.CENTER);
+    label(
+        c,
+        "A lightweight, offline physics toy.",
+        getWidth() / 2f,
+        dp(183),
+        14,
+        MUTED,
+        Paint.Align.CENTER);
+    label(
+        c,
+        "No ads. No network. No tracking.",
+        getWidth() / 2f,
+        dp(216),
+        13,
+        INK,
+        Paint.Align.CENTER);
+    rect.set(dp(28), dp(255), getWidth() - dp(28), dp(405));
+    paint.setColor(Color.argb(145, 255, 255, 255));
+    c.drawRoundRect(rect, dp(20), dp(20), paint);
+    label(c, "Built with Android Canvas", getWidth() / 2f, dp(300), 15, INK, Paint.Align.CENTER);
+    label(
+        c,
+        "Frame-time physics • local records",
+        getWidth() / 2f,
+        dp(332),
+        12,
+        MUTED,
+        Paint.Align.CENTER);
+    label(c, "Version 1.1.0", getWidth() / 2f, dp(369), 12, MUTED, Paint.Align.CENTER);
+  }
+
+  private void drawChallenge(Canvas c) {
+    screenTitle(c, "Challenges");
+    DailyChallenge d = DailyChallenge.today();
+    rect.set(dp(26), dp(105), getWidth() - dp(26), dp(310));
+    paint.setColor(Color.argb(170, 255, 255, 255));
+    c.drawRoundRect(rect, dp(22), dp(22), paint);
+    label(c, d.title, getWidth() / 2f, dp(157), 22, INK, Paint.Align.CENTER);
+    label(c, d.description, getWidth() / 2f, dp(197), 14, MUTED, Paint.Align.CENTER);
+    label(
+        c, "A fresh challenge every day", getWidth() / 2f, dp(239), 11, MUTED, Paint.Align.CENTER);
+    button(c, dp(52), dp(326), getWidth() - dp(52), dp(386), "PLAY DAILY", true);
+    button(c, dp(52), dp(410), getWidth() - dp(52), dp(470), "10 SECOND DUEL", false);
+    label(
+        c,
+        "One player per side. Maximum useless glory.",
+        getWidth() / 2f,
+        dp(497),
+        10,
+        MUTED,
+        Paint.Align.CENTER);
+  }
+
+  private void drawResults(Canvas c) {
+    screenTitle(c, "Run complete");
+    label(c, "MISSIONS COMPLETED", getWidth() / 2f, dp(137), 11, MUTED, Paint.Align.CENTER);
+    label(
+        c,
+        String.valueOf(lastResult == null ? 0 : lastResult.missions),
+        getWidth() / 2f,
+        dp(204),
+        52,
+        INK,
+        Paint.Align.CENTER);
+    if (lastResult != null) {
+      stat(c, "Total taps", String.valueOf(lastResult.taps), dp(260));
+      stat(c, "Best streak", String.valueOf(speedBestStreak), dp(302));
+      stat(c, "Session time", formatDuration(lastResult.durationMs), dp(344));
+      stat(c, "Final score", String.valueOf(lastResult.score), dp(386));
+      stat(c, "Skin", GamePreferences.skinName(lastResult.skinId), dp(428));
+      stat(c, "Max carry", String.format(Locale.US, "%.1f s", lastResult.maxCarrySeconds), dp(470));
+    }
+    button(c, dp(26), dp(515), getWidth() / 2f - dp(7), dp(573), "HOME", false);
+    button(c, getWidth() / 2f + dp(7), dp(515), getWidth() - dp(26), dp(573), "TRY AGAIN", true);
+    button(c, dp(26), dp(584), getWidth() - dp(26), dp(634), "SHARE RESULT", false);
+  }
+
+  private void stat(Canvas c, String key, String value, float y) {
+    label(c, key, dp(34), y, 13, MUTED, Paint.Align.LEFT);
+    label(c, value, getWidth() - dp(34), y, 14, INK, Paint.Align.RIGHT);
+  }
+
+  private void screenTitle(Canvas c, String title) {
+    label(c, "‹", dp(24), dp(49), 27, INK, Paint.Align.LEFT);
+    label(c, title, getWidth() / 2f, dp(48), 22, INK, Paint.Align.CENTER);
+  }
+
+  @Override
+  public boolean onTouchEvent(MotionEvent e) {
+    if (e.getAction() != MotionEvent.ACTION_DOWN) return true;
+    performClick();
+    float x = e.getX(), y = e.getY();
+    if (screen != Screen.HOME && y < dp(78) && x < dp(70)) {
+      navigateBack();
+      return true;
+    }
+    switch (screen) {
+      case HOME:
+        touchHome(y);
+        break;
+      case GAME:
+      case SPEED:
+        touchGame(x, y);
+        break;
+      case SETTINGS:
+        touchSettings(x, y);
+        break;
+      case RECORDS:
+        if (y >= dp(88) && y <= dp(135)) {
+          selectedRecordFilter = Math.min(3, (int) (x / (getWidth() / 4f)));
+          invalidate();
         }
-        float horizontal = state.mode.equals("GRAVITY") ? tiltX * dp(145) : tiltX * dp(18);
-        left.step(dt, gravity, damping, horizontal);
-        right.step(dt, gravity, damping, horizontal);
-        resolveCollision();
-        shake *= 0.87f;
-        if (flashFrames > 0) flashFrames--;
-
-        for (int i = particles.size() - 1; i >= 0; i--) {
-            Particle q = particles.get(i);
-            q.vy += dp(250) * dt;
-            q.x += q.vx * dt;
-            q.y += q.vy * dt;
-            q.life -= dt;
-            if (q.life <= 0) particles.remove(i);
+        break;
+      case SKINS:
+        touchChoice(y, false);
+        break;
+      case MODES:
+        touchChoice(y, true);
+        break;
+      case CHALLENGE:
+        if (y >= dp(315) && y < dp(400)) startDailyChallenge();
+        else if (y >= dp(400) && y <= dp(485)) startDuel();
+        break;
+      case RESULTS:
+        if (y >= dp(580) && lastResult != null)
+          host.shareSnapshot(
+              "Bikaram Speed Mode: "
+                  + lastResult.missions
+                  + " missions, "
+                  + lastResult.taps
+                  + " taps, skin "
+                  + GamePreferences.skinName(lastResult.skinId));
+        else if (y >= dp(500)) {
+          if (x < getWidth() / 2f) {
+            screen = Screen.HOME;
+            invalidate();
+          } else startSpeed();
         }
-
-        long ms = System.currentTimeMillis();
-        if (duelActive && ms - duelStarted >= 10_000) finishDuel();
-        if (challengeRunning && challenge.durationMs > 0 && ms - challengeStarted >= challenge.durationMs && challengeProgress < challenge.target) {
-            challengeRunning = false;
-            challengeFailed = true;
-            showToast("وقت تموم شد 😵 دوباره بزن", 1900);
-        }
+        break;
+      default:
+        break;
     }
+    return true;
+  }
 
-    private void resolveCollision() {
-        float dx = right.x - left.x;
-        float dy = right.y - left.y;
-        float d = (float) Math.sqrt(dx * dx + dy * dy);
-        float min = left.radius + right.radius - dp(8);
-        if (d < min && d > 1) {
-            float push = (min - d) / min;
-            float tmp = left.angularVelocity;
-            left.angularVelocity = right.angularVelocity * .88f - push * .5f;
-            right.angularVelocity = tmp * .88f + push * .5f;
-            if (!state.mode.equals("OFFICE") && random.nextFloat() < .12f) playBonk();
-        }
+  @Override
+  public boolean performClick() {
+    super.performClick();
+    return true;
+  }
+
+  private void touchHome(float y) {
+    if (y >= dp(282) && y <= dp(360)) {
+      openGame();
+      return;
     }
-
-    private void drawBackground(Canvas c) {
-        int top = Color.rgb(249, 245, 235);
-        int bottom = Color.rgb(231, 224, 209);
-        p.setShader(new LinearGradient(0, 0, 0, getHeight(), top, bottom, Shader.TileMode.CLAMP));
-        c.drawRect(0, 0, getWidth(), getHeight(), p);
-        p.setShader(null);
-        if (flashFrames > 0) {
-            p.setColor(Color.argb(45 + flashFrames * 8, 255, 220, 80));
-            c.drawRect(0, 0, getWidth(), getHeight(), p);
-        }
+    if (y >= dp(362) && y <= dp(432)) {
+      startSpeed();
+      return;
     }
+    float top = dp(442), row = Math.min(dp(46), (getHeight() - top - dp(14)) / 7f);
+    int index = (int) ((y - top) / row);
+    if (y < top || index < 0 || index > 6) return;
+    Screen[] targets = {
+      Screen.MODES,
+      Screen.CHALLENGE,
+      Screen.RECORDS,
+      Screen.ACHIEVEMENTS,
+      Screen.SKINS,
+      Screen.SETTINGS,
+      Screen.ABOUT
+    };
+    open(targets[index]);
+  }
 
-    private void drawHeader(Canvas c) {
-        text.setTextAlign(Paint.Align.CENTER);
-        text.setColor(Color.rgb(25, 25, 25));
-        text.setTextSize(sp(28));
-        c.drawText("بیکارم!", getWidth()/2f, dp(46), text);
-        text.setTextSize(sp(12));
-        text.setTypeface(Typeface.create("sans", Typeface.NORMAL));
-        c.drawText("وقتی واقعاً هیچ کاری نداری", getWidth()/2f, dp(67), text);
-        text.setTypeface(Typeface.create("sans", Typeface.BOLD));
-
-        drawPill(c, dp(14), dp(82), getWidth()*0.48f-dp(18), dp(42), boredomLabel(), Color.rgb(255,255,255));
-        drawPill(c, getWidth()*0.52f, dp(82), getWidth()-dp(14), dp(42), String.format(Locale.US,"امروز %,d ضربه", state.todayTaps), Color.rgb(255,255,255));
+  private void touchGame(float x, float y) {
+    if (y < dp(76) && x > getWidth() - dp(75)) {
+      navigateBack();
+      return;
     }
-
-    private void drawPlayground(Canvas c) {
-        float y = getHeight() * .18f;
-        p.setColor(Color.rgb(53, 49, 43));
-        p.setStrokeWidth(dp(7));
-        p.setStrokeCap(Paint.Cap.ROUND);
-        c.drawLine(getWidth()*.29f, y, getWidth()*.71f, y, p);
-        p.setColor(Color.argb(45,0,0,0));
-        c.drawOval(getWidth()*.25f, getHeight()*.58f, getWidth()*.75f, getHeight()*.64f, p);
-
-        text.setTextAlign(Paint.Align.CENTER);
-        text.setTextSize(sp(13));
-        text.setColor(Color.rgb(80,75,68));
-        c.drawText("بزن روشون — پشت سر هم بزنی وحشی‌تر می‌شن", getWidth()/2f, getHeight()*.69f, text);
-
-        if (duelActive) {
-            long remain = Math.max(0, 10_000 - (System.currentTimeMillis()-duelStarted));
-            text.setTextSize(sp(20)); text.setColor(Color.rgb(20,20,20));
-            c.drawText(String.format(Locale.US,"دو نفره  %.1fs", remain/1000f), getWidth()/2f, getHeight()*.16f, text);
-            text.setTextSize(sp(16));
-            c.drawText("چپ: "+duelLeft+"     راست: "+duelRight, getWidth()/2f, getHeight()*.72f, text);
-        }
-        if (challengeRunning) {
-            text.setTextSize(sp(15)); text.setColor(Color.rgb(20,20,20));
-            c.drawText(challenge.title+"  "+challengeProgress+"/"+challenge.target, getWidth()/2f, getHeight()*.735f, text);
-        }
+    if (screen == Screen.SPEED && (countdown > 0 || successPause > 0)) return;
+    boolean hitLeft = distanceSquared(x, y, left.x, left.y) < left.radius * left.radius * 2.1f,
+        hitRight = distanceSquared(x, y, right.x, right.y) < right.radius * right.radius * 2.1f;
+    if (!hitLeft && !hitRight) {
+      if (y > left.anchorY && y < getHeight() * .78f) hitLeft = x < getWidth() / 2f;
+      else return;
     }
+    tap(hitLeft ? 0 : 1);
+  }
 
-    private void drawBalls(Canvas c) {
-        drawOneBall(c, left, true);
-        drawOneBall(c, right, false);
+  private void touchSettings(float x, float y) {
+    if (y >= dp(105) && y < dp(341)) {
+      int row = Math.min(3, (int) ((y - dp(105)) / dp(59)));
+      if (row == 0) prefs.setSound(!prefs.sound());
+      else if (row == 1) prefs.setHaptics(!prefs.haptics());
+      else if (row == 2) prefs.setDeviceGravity(!prefs.deviceGravity());
+      else prefs.setReducedMotion(!prefs.reducedMotion());
+      updateSensorRegistration();
+      haptic(0);
+      invalidate();
+      return;
     }
-
-    private void drawOneBall(Canvas c, PhysicsBall b, boolean isLeft) {
-        p.setStyle(Paint.Style.STROKE);
-        p.setStrokeWidth(dp(8));
-        p.setStrokeCap(Paint.Cap.ROUND);
-        p.setColor(Color.rgb(74,61,53));
-        c.drawLine(b.anchorX, b.anchorY, b.x, b.y - b.radius*.55f, p);
-        p.setStyle(Paint.Style.FILL);
-
-        c.save();
-        c.rotate((float)Math.toDegrees(b.angle)*.35f, b.x, b.y);
-        float rx = b.radius * .90f;
-        float ry = b.radius * 1.15f;
-        RectF oval = new RectF(b.x-rx, b.y-ry, b.x+rx, b.y+ry);
-        drawSkin(c, oval, b, isLeft);
-        drawWrinklesAndHair(c, oval, b, isLeft);
-        c.restore();
-    }
-
-    private void drawSkin(Canvas c, RectF oval, PhysicsBall b, boolean isLeft) {
-        int base = Color.rgb(190,136,106);
-        int dark = Color.rgb(116,75,59);
-        int light = Color.rgb(234,184,145);
-        switch (state.skin) {
-            case "COCONUT": base=Color.rgb(126,83,50); dark=Color.rgb(70,43,25); light=Color.rgb(165,112,68); break;
-            case "WATERMELON": base=Color.rgb(75,166,82); dark=Color.rgb(19,93,45); light=Color.rgb(112,204,106); break;
-            case "MOON": base=Color.rgb(187,188,186); dark=Color.rgb(95,98,101); light=Color.rgb(225,226,220); break;
-            case "PINGPONG": base=Color.rgb(248,245,234); dark=Color.rgb(184,180,164); light=Color.WHITE; break;
-            case "FOOTBALL": base=Color.rgb(237,234,222); dark=Color.rgb(37,37,37); light=Color.WHITE; break;
-            case "DISCO": base=Color.rgb(160,170,184); dark=Color.rgb(55,60,72); light=Color.rgb(235,242,255); break;
-        }
-        p.setShader(new RadialGradient(oval.centerX()-oval.width()*.18f, oval.centerY()-oval.height()*.24f,
-                oval.width()*.85f, new int[]{light,base,dark}, new float[]{0f,.48f,1f}, Shader.TileMode.CLAMP));
-        c.drawOval(oval,p); p.setShader(null);
-
-        if (state.skin.equals("FOOTBALL")) {
-            p.setColor(Color.rgb(40,40,40));
-            for(int i=0;i<5;i++){
-                double a=i*Math.PI*2/5 + (isLeft?0:.4);
-                c.drawCircle(oval.centerX()+(float)Math.cos(a)*oval.width()*.20f, oval.centerY()+(float)Math.sin(a)*oval.height()*.22f, oval.width()*.09f,p);
-            }
-        } else if (state.skin.equals("WATERMELON")) {
-            p.setColor(Color.rgb(31,112,54)); p.setStrokeWidth(dp(3)); p.setStyle(Paint.Style.STROKE);
-            for(int i=-2;i<=2;i++) c.drawArc(new RectF(oval.left+i*dp(5),oval.top,oval.right-i*dp(5),oval.bottom),80,200,false,p);
-            p.setStyle(Paint.Style.FILL);
-        } else if (state.skin.equals("DISCO")) {
-            p.setColor(Color.argb(105,255,255,255)); p.setStrokeWidth(dp(1.3f));
-            for(float yy=oval.top+dp(12); yy<oval.bottom; yy+=dp(12)) c.drawLine(oval.left,yy,oval.right,yy,p);
-            for(float xx=oval.left+dp(12); xx<oval.right; xx+=dp(12)) c.drawLine(xx,oval.top,xx,oval.bottom,p);
-        } else if (state.skin.equals("MOON")) {
-            p.setColor(Color.argb(40,30,30,30));
-            c.drawCircle(oval.centerX()-oval.width()*.22f,oval.centerY()+oval.height()*.15f,oval.width()*.10f,p);
-            c.drawCircle(oval.centerX()+oval.width()*.18f,oval.centerY()-oval.height()*.12f,oval.width()*.07f,p);
-        }
-    }
-
-    private void drawWrinklesAndHair(Canvas c, RectF oval, PhysicsBall b, boolean isLeft) {
-        if (!state.skin.equals("CLASSIC") && !state.skin.equals("COCONUT")) return;
-        p.setStyle(Paint.Style.STROKE);
-        p.setStrokeCap(Paint.Cap.ROUND);
-        p.setStrokeWidth(dp(1.15f));
-        p.setColor(Color.argb(95, 76, 45, 35));
-        for (int i=0;i<4;i++) {
-            float yy=oval.centerY() + (i-1.5f)*oval.height()*.10f;
-            c.drawArc(new RectF(oval.left+oval.width()*.20f,yy-dp(4),oval.right-oval.width()*.20f,yy+dp(5)),20,140,false,p);
-        }
-        // Sparse stylized hair: deliberately non-erotic/cartoon-realistic.
-        p.setColor(Color.rgb(58,42,35)); p.setStrokeWidth(dp(1.2f));
-        int seed = isLeft ? 17 : 31;
-        for (int i=0;i<10;i++) {
-            float t=(i+1)/11f;
-            float yy=oval.top+oval.height()*(.16f+.58f*t);
-            float side=((i+seed)%2==0?-1:1);
-            float xx=oval.centerX()+side*oval.width()*(.22f+.08f*((i*7)%3));
-            float len=dp(5+((i*5+seed)%5));
-            c.drawLine(xx,yy,xx+side*len*.55f,yy-len,p);
-        }
-        p.setStyle(Paint.Style.FILL);
-    }
-
-    private void drawParticles(Canvas c) {
-        for (Particle q : particles) {
-            p.setColor(q.color); p.setAlpha((int)(255*Math.min(1,q.life)));
-            c.drawCircle(q.x,q.y,dp(4),p);
-        }
-        p.setAlpha(255);
-    }
-
-    private void drawBottomBar(Canvas c) {
-        float h=dp(70), y=getHeight()-h-dp(10), gap=dp(6), leftX=dp(8);
-        String[] labels={"مود", "پوسته", "چالش", "۲ نفره", "آمار/ارسال"};
-        for(int i=0;i<5;i++){
-            float bw=(getWidth()-dp(16)-gap*4)/5f;
-            RectF r=new RectF(leftX+i*(bw+gap),y,leftX+i*(bw+gap)+bw,y+h);
-            p.setColor(i==3&&duelActive?Color.rgb(250,210,70):Color.rgb(30,30,30));
-            c.drawRoundRect(r,dp(16),dp(16),p);
-            text.setTextAlign(Paint.Align.CENTER); text.setTextSize(sp(10.5f));
-            text.setColor(i==3&&duelActive?Color.BLACK:Color.WHITE);
-            c.drawText(labels[i],r.centerX(),r.centerY()+dp(4),text);
-        }
-    }
-
-    private void drawOverlays(Canvas c) {
-        long now=System.currentTimeMillis();
-        if (toastUntil>now) {
-            float w=getWidth()*.82f; RectF r=new RectF((getWidth()-w)/2,getHeight()*.76f,(getWidth()+w)/2,getHeight()*.76f+dp(50));
-            p.setColor(Color.argb(225,22,22,22)); c.drawRoundRect(r,dp(16),dp(16),p);
-            text.setTextAlign(Paint.Align.CENTER); text.setTextSize(sp(13)); text.setColor(Color.WHITE);
-            c.drawText(toast,r.centerX(),r.centerY()+dp(5),text);
-        }
-        if (!duelResult.isEmpty() && duelResultUntil>now) showCenterCard(c,"نبرد بیکاری",duelResult);
-        if (menuModes) drawChoiceMenu(c,"مود بازی",MODE_FA,state.mode,true);
-        if (menuSkins) drawChoiceMenu(c,"پوسته",SKIN_FA,state.skin,false);
-        if (challengeOpen) drawChallengeCard(c);
-        if (statsOpen) drawStats(c);
-    }
-
-    private void drawChoiceMenu(Canvas c,String title,String[] fa,String current,boolean modes) {
-        RectF box=new RectF(dp(24),getHeight()*.18f,getWidth()-dp(24),getHeight()*.77f);
-        p.setColor(Color.argb(245,250,247,240)); c.drawRoundRect(box,dp(24),dp(24),p);
-        text.setColor(Color.BLACK); text.setTextSize(sp(21)); text.setTextAlign(Paint.Align.CENTER); c.drawText(title,box.centerX(),box.top+dp(42),text);
-        int count=fa.length; float top=box.top+dp(70), row=(box.height()-dp(92))/count;
-        for(int i=0;i<count;i++){
-            String key=modes?MODES[i]:SKINS[i];
-            RectF r=new RectF(box.left+dp(18),top+i*row,box.right-dp(18),top+(i+1)*row-dp(5));
-            p.setColor(key.equals(current)?Color.rgb(245,206,72):Color.rgb(235,230,220)); c.drawRoundRect(r,dp(12),dp(12),p);
-            text.setTextSize(sp(14)); c.drawText(fa[i],r.centerX(),r.centerY()+dp(5),text);
-        }
-    }
-
-    private void drawChallengeCard(Canvas c) {
-        RectF box=new RectF(dp(22),getHeight()*.25f,getWidth()-dp(22),getHeight()*.65f);
-        p.setColor(Color.argb(248,252,249,242)); c.drawRoundRect(box,dp(24),dp(24),p);
-        text.setTextAlign(Paint.Align.CENTER); text.setColor(Color.BLACK); text.setTextSize(sp(21)); c.drawText(challenge.title,box.centerX(),box.top+dp(48),text);
-        text.setTextSize(sp(15)); c.drawText(challenge.description,box.centerX(),box.top+dp(84),text);
-        text.setTextSize(sp(12)); text.setColor(Color.DKGRAY); c.drawText("چالش هر روز عوض می‌شود",box.centerX(),box.top+dp(112),text);
-        RectF btn=new RectF(box.left+dp(40),box.bottom-dp(78),box.right-dp(40),box.bottom-dp(26));
-        p.setColor(Color.rgb(26,26,26)); c.drawRoundRect(btn,dp(16),dp(16),p); text.setColor(Color.WHITE); text.setTextSize(sp(14));
-        c.drawText(challengeRunning?"در حال اجرا...":"شروع چالش",btn.centerX(),btn.centerY()+dp(5),text);
-    }
-
-    private void drawStats(Canvas c) {
-        RectF box=new RectF(dp(20),getHeight()*.18f,getWidth()-dp(20),getHeight()*.72f);
-        p.setColor(Color.argb(250,252,249,242)); c.drawRoundRect(box,dp(24),dp(24),p);
-        text.setTextAlign(Paint.Align.CENTER); text.setColor(Color.BLACK); text.setTextSize(sp(21)); c.drawText("کارنامه بیکاری",box.centerX(),box.top+dp(44),text);
-        text.setTextSize(sp(15));
-        c.drawText(String.format(Locale.US,"کل ضربه‌ها: %,d",state.totalTaps),box.centerX(),box.top+dp(92),text);
-        c.drawText(String.format(Locale.US,"امروز: %,d",state.todayTaps),box.centerX(),box.top+dp(126),text);
-        c.drawText("بهترین رگبار: "+state.bestStreak,box.centerX(),box.top+dp(160),text);
-        c.drawText("برد دو نفره: "+state.duelWins,box.centerX(),box.top+dp(194),text);
-        text.setTextSize(sp(14)); text.setColor(Color.rgb(120,70,20)); c.drawText(percentileJoke(),box.centerX(),box.top+dp(238),text);
-        RectF btn=new RectF(box.left+dp(36),box.bottom-dp(76),box.right-dp(36),box.bottom-dp(24));
-        p.setColor(Color.rgb(30,30,30)); c.drawRoundRect(btn,dp(16),dp(16),p); text.setColor(Color.WHITE); c.drawText("عکس رکورد رو بفرست",btn.centerX(),btn.centerY()+dp(5),text);
-    }
-
-    private void showCenterCard(Canvas c,String title,String body) {
-        RectF box=new RectF(dp(30),getHeight()*.32f,getWidth()-dp(30),getHeight()*.52f);
-        p.setColor(Color.argb(245,25,25,25)); c.drawRoundRect(box,dp(24),dp(24),p);
-        text.setTextAlign(Paint.Align.CENTER); text.setColor(Color.WHITE); text.setTextSize(sp(20)); c.drawText(title,box.centerX(),box.top+dp(52),text);
-        text.setTextSize(sp(15)); c.drawText(body,box.centerX(),box.top+dp(94),text);
-    }
-
-    @Override public boolean onTouchEvent(MotionEvent e) {
-        if (e.getAction()!=MotionEvent.ACTION_DOWN) return true;
-        float x=e.getX(), y=e.getY();
-
-        if (menuModes) return handleChoice(x,y,true);
-        if (menuSkins) return handleChoice(x,y,false);
-        if (challengeOpen) {
-            RectF box=new RectF(dp(22),getHeight()*.25f,getWidth()-dp(22),getHeight()*.65f);
-            RectF btn=new RectF(box.left+dp(40),box.bottom-dp(78),box.right-dp(40),box.bottom-dp(26));
-            if(btn.contains(x,y)){ startChallenge(); challengeOpen=false; }
-            else challengeOpen=false;
-            invalidate(); return true;
-        }
-        if (statsOpen) {
-            RectF box=new RectF(dp(20),getHeight()*.18f,getWidth()-dp(20),getHeight()*.72f);
-            RectF btn=new RectF(box.left+dp(36),box.bottom-dp(76),box.right-dp(36),box.bottom-dp(24));
-            if(btn.contains(x,y)) host.shareSnapshot(shareText());
-            else statsOpen=false;
-            invalidate(); return true;
-        }
-
-        float bottomY=getHeight()-dp(80);
-        if(y>=bottomY){
-            float slot=getWidth()/5f; int i=Math.min(4,(int)(x/slot));
-            if(i==0) menuModes=true;
-            else if(i==1) menuSkins=true;
-            else if(i==2) challengeOpen=true;
-            else if(i==3) startDuel();
-            else statsOpen=true;
-            invalidate(); return true;
-        }
-
-        boolean hitLeft = dist(x,y,left.x,left.y) < left.radius*1.35f;
-        boolean hitRight = dist(x,y,right.x,right.y) < right.radius*1.35f;
-        if(!hitLeft&&!hitRight){
-            // forgiving touch zones: left/right half in playfield
-            if(y>getHeight()*.20f && y<getHeight()*.68f) hitLeft=x<getWidth()/2f; else return true;
-        }
-        tap(hitLeft?0:1);
-        return true;
-    }
-
-    private boolean handleChoice(float x,float y,boolean modes) {
-        RectF box=new RectF(dp(24),getHeight()*.18f,getWidth()-dp(24),getHeight()*.77f);
-        String[] keys=modes?MODES:SKINS;
-        float top=box.top+dp(70),row=(box.height()-dp(92))/keys.length;
-        if(x>box.left&&x<box.right&&y>=top&&y<=top+row*keys.length){
-            int index=Math.min(keys.length-1,(int)((y-top)/row));
-            if(modes) state.setMode(keys[index]); else state.setSkin(keys[index]);
-            showToast((modes?"مود: ":"پوسته: ")+(modes?MODE_FA[index]:SKIN_FA[index]),1200);
-        }
-        menuModes=false; menuSkins=false; invalidate(); return true;
-    }
-
-    private void tap(int side) {
-        long now=System.currentTimeMillis();
-        streak=(now-lastTapMs<430)?streak+1:1;
-        lastTapMs=now;
-        float chaos=Math.min(2.8f,1f+streak*.035f);
-        float base=1.6f*chaos;
-        if(state.mode.equals("ZEN")) base*=.65f;
-        if(state.mode.equals("RAGE")) base*=1.5f;
-        if(state.mode.equals("TURBO")) base*=2f;
-        if(side==0) left.impulse((random.nextBoolean()?1:-1)*base); else right.impulse((random.nextBoolean()?1:-1)*base);
-        if(streak>12) { left.impulse((random.nextFloat()-.5f)*.25f*chaos); right.impulse((random.nextFloat()-.5f)*.25f*chaos); }
-        if(streak>22 || state.mode.equals("RAGE")) shake=Math.min(dp(22),shake+dp(2.2f));
-
-        state.onTap(streak);
-        if(duelActive){ if(side==0) duelLeft++; else duelRight++; }
-        handleChallengeTap(side);
-        tactile();
-        secretEvents();
-        checkAchievements();
+    if (y >= dp(374) && y <= dp(432)) {
+      int i = Math.min(2, (int) ((x - dp(28)) / ((getWidth() - dp(56)) / 3f)));
+      if (i >= 0) {
+        prefs.setIntensity(new String[] {"CALM", "NORMAL", "WILD"}[i]);
         invalidate();
+      }
+      return;
     }
-
-    private void tactile() {
-        if(state.mode.equals("OFFICE")) return;
-        int amp=state.mode.equals("RAGE")?90:state.mode.equals("ZEN")?25:55;
-        try { if(Build.VERSION.SDK_INT>=26) vibrator.vibrate(VibrationEffect.createOneShot(8,amp)); else vibrator.vibrate(8); } catch(Exception ignored){}
-        if(tone!=null){
-            int toneId= state.mode.equals("ZEN")?ToneGenerator.TONE_PROP_BEEP2:ToneGenerator.TONE_PROP_BEEP;
-            try{ tone.startTone(toneId,25); }catch(Exception ignored){}
-        }
+    if (y >= dp(450) && y <= dp(518)) {
+      prefs.resetStatistics();
+      showToast("Statistics reset", 1.5f);
+    } else if (y >= dp(518) && y <= dp(585)) {
+      prefs.resetAchievements();
+      showToast("Achievements reset", 1.5f);
     }
+    invalidate();
+  }
 
-    private void playBonk(){ if(tone!=null) try{tone.startTone(ToneGenerator.TONE_PROP_NACK,45);}catch(Exception ignored){} }
-
-    private void secretEvents() {
-        long n=state.totalTaps;
-        if(n==50){ flashFrames=9; showToast("۵۰ تا؟ تازه گرم شدی 😏",1600); }
-        if(n==100){ left.impulse(8f); right.impulse(-8f); showToast("صدتا! کار و زندگی واقعاً تعطیله",1900); }
-        if(n==500){ tiltX=random.nextBoolean()?8:-8; showToast("۵۰۰! جاذبه هم دیگه خسته شد",2000); }
-        if(n==1000){ confetti(55); showToast("هزار تا! مدال بیکاری unlocked 🏆",2200); }
-        if(n>0 && n%5000==0){ confetti(90); left.impulse(11); right.impulse(-11); showToast("این عدد رو جدی جدی زدی؟!",2000); }
+  private void touchChoice(float y, boolean modes) {
+    int index = (int) ((y - dp(102)) / dp(66));
+    String[] ids = modes ? GameModeConfig.IDS : GamePreferences.SKIN_IDS;
+    if (index < 0 || index >= ids.length) return;
+    if (modes) prefs.setMode(ids[index]);
+    else {
+      prefs.setSkin(ids[index]);
+      cachedSkin = "";
     }
+    haptic(0);
+    invalidate();
+  }
 
-    private void checkAchievements() {
-        for(int i=0;i<ACHIEVEMENTS.length;i++){
-            long a=ACHIEVEMENTS[i];
-            if(state.totalTaps>=a&&!state.achievementUnlocked(a)){
-                state.unlockAchievement(a); showToast("🏅 "+ACHIEVEMENT_NAMES[i],2200); confetti(25); break;
-            }
-        }
+  private void open(Screen target) {
+    previousScreen = screen;
+    screen = target;
+    updateSensorRegistration();
+    invalidate();
+  }
+
+  private void openGame() {
+    screen = Screen.GAME;
+    classicStartedAt = System.currentTimeMillis();
+    classicTaps = 0;
+    lastFrameNanos = 0;
+    updateSensorRegistration();
+    requestFrame();
+    invalidate();
+  }
+
+  private void tap(int side) {
+    long now = System.currentTimeMillis();
+    streak = now - lastTapMs < 430 ? streak + 1 : 1;
+    lastTapMs = now;
+    float chaos = Math.min(2.15f, 1f + streak * .025f);
+    GameModeConfig mode = GameModeConfig.forId(prefs.mode());
+    float intensity =
+        prefs.reducedMotion()
+            ? .72f
+            : "CALM".equals(prefs.intensity())
+                ? .82f
+                : "WILD".equals(prefs.intensity()) ? 1.14f : 1f;
+    float impulse = mode.tapImpulse * chaos * intensity * (random.nextBoolean() ? 1 : -1);
+    if (side == 0) left.impulse(impulse);
+    else right.impulse(impulse);
+    if (streak > 14) {
+      left.impulse((random.nextFloat() - .5f) * .18f * chaos);
+      right.impulse((random.nextFloat() - .5f) * .18f * chaos);
     }
-
-    private void confetti(int count) {
-        int[] colors={Color.rgb(236,70,70),Color.rgb(245,195,55),Color.rgb(70,155,235),Color.rgb(80,190,125),Color.rgb(165,95,220)};
-        for(int i=0;i<count;i++){
-            Particle q=new Particle(); q.x=getWidth()/2f; q.y=getHeight()*.38f; q.vx=(random.nextFloat()-.5f)*dp(450); q.vy=-random.nextFloat()*dp(460)-dp(80); q.life=.8f+random.nextFloat()*1.4f; q.color=colors[i%colors.length]; particles.add(q);
-        }
+    if (streak > 25 && !prefs.reducedMotion()) shake = Math.min(dp(10), shake + dp(1));
+    prefs.recordTap(streak);
+    checkTapAchievements();
+    haptic(0);
+    playTap();
+    if (screen == Screen.SPEED) handleSpeedTap(side);
+    else {
+      classicTaps++;
+      if (duelActive) {
+        if (side == 0) duelLeft++;
+        else duelRight++;
+      }
+      handleChallengeTap(side);
     }
+    requestFrame();
+  }
 
-    private void startDuel() {
-        menuModes=menuSkins=statsOpen=challengeOpen=false;
-        challengeRunning=false; duelActive=true; duelStarted=System.currentTimeMillis(); duelLeft=duelRight=0; duelResult="";
-        showToast("۱۰ ثانیه! هر نفر یک سمت — برو!",1500);
+  private void startDailyChallenge() {
+    activeChallenge = DailyChallenge.today();
+    challengeProgress = 0;
+    challengeLastSide = -1;
+    challengeTimeLeft = activeChallenge.durationMs / 1000f;
+    prefs.setMode("NORMAL");
+    openGame();
+    showToast(activeChallenge.description, 1.5f);
+  }
+
+  private void startDuel() {
+    activeChallenge = null;
+    openGame();
+    duelActive = true;
+    duelTimeLeft = 10f;
+    duelLeft = duelRight = 0;
+    showToast("One player per side — GO!", 1.2f);
+  }
+
+  private void finishDuel() {
+    duelActive = false;
+    String result =
+        duelLeft == duelRight
+            ? "Draw — equally bored"
+            : duelLeft > duelRight
+                ? "LEFT wins " + duelLeft + "–" + duelRight
+                : "RIGHT wins " + duelRight + "–" + duelLeft;
+    prefs.saveRecord(
+        new GameRecord(
+            "CHALLENGE",
+            Math.max(duelLeft, duelRight),
+            0,
+            duelLeft + duelRight,
+            10_000,
+            prefs.skin(),
+            System.currentTimeMillis(),
+            1,
+            0));
+    confetti(35);
+    haptic(3);
+    showToast(result, 2.2f);
+  }
+
+  private void handleChallengeTap(int side) {
+    if (activeChallenge == null) return;
+    boolean valid = activeChallenge.type != DailyChallenge.Type.LEFT_ONLY || side == 0;
+    if (activeChallenge.type == DailyChallenge.Type.ALTERNATE && challengeLastSide != -1)
+      valid = side != challengeLastSide;
+    if (!valid) {
+      activeChallenge = null;
+      showToast("Challenge pattern broken", 1.6f);
+      return;
     }
-
-    private void finishDuel() {
-        duelActive=false;
-        if(duelLeft>duelRight){duelResult="چپ برد!  "+duelLeft+" - "+duelRight; state.addDuelWin();}
-        else if(duelRight>duelLeft){duelResult="راست برد!  "+duelRight+" - "+duelLeft; state.addDuelWin();}
-        else duelResult="مساوی! هر دوتون به یک اندازه بیکارید 😐";
-        duelResultUntil=System.currentTimeMillis()+2600; confetti(40);
+    challengeProgress++;
+    challengeLastSide = side;
+    if (challengeProgress >= activeChallenge.target) {
+      long duration =
+          activeChallenge.durationMs > 0
+              ? (long) ((activeChallenge.durationMs / 1000f - challengeTimeLeft) * 1000)
+              : System.currentTimeMillis() - classicStartedAt;
+      prefs.saveRecord(
+          new GameRecord(
+              "CHALLENGE",
+              challengeProgress,
+              0,
+              challengeProgress,
+              duration,
+              prefs.skin(),
+              System.currentTimeMillis(),
+              1,
+              0));
+      activeChallenge = null;
+      confetti(50);
+      haptic(3);
+      showToast("Daily challenge complete!", 2f);
     }
+  }
 
-    private void startChallenge() {
-        challenge=DailyChallenge.today(); challengeRunning=true; challengeFailed=false; challengeProgress=0; lastChallengeSide=-1; challengeStarted=System.currentTimeMillis();
-        showToast(challenge.description,1600);
+  private void finishClassicRun() {
+    if (classicTaps > 0) {
+      prefs.saveRecord(
+          new GameRecord(
+              "CLASSIC",
+              classicTaps,
+              0,
+              classicTaps,
+              System.currentTimeMillis() - classicStartedAt,
+              prefs.skin(),
+              System.currentTimeMillis(),
+              0,
+              0));
+      classicTaps = 0;
     }
+    activeChallenge = null;
+    duelActive = false;
+    prefs.flush();
+  }
 
-    private void handleChallengeTap(int side) {
-        if(!challengeRunning) return;
-        boolean ok=true;
-        if(challenge.type==DailyChallenge.Type.LEFT_ONLY) ok=side==0;
-        else if(challenge.type==DailyChallenge.Type.ALTERNATE && lastChallengeSide!=-1) ok=side!=lastChallengeSide;
-        if(!ok){ challengeRunning=false; challengeFailed=true; showToast("ای بابا! قانون چالش رو شکستی 😵",1700); return; }
-        challengeProgress++; lastChallengeSide=side;
-        if(challengeProgress>=challenge.target){ challengeRunning=false; confetti(70); showToast("چالش امروز ترکید! ✅",2300); }
+  private void startSpeed() {
+    screen = Screen.SPEED;
+    missionIndex =
+        completedMissions = speedTaps = speedBestStreak = speedStreak = highestDifficulty = 0;
+    speedLastSide = -1;
+    carrySeconds = maxCarry = sessionSeconds = successPause = 0;
+    beginMission();
+    countdown = 4f;
+    updateSensorRegistration();
+    requestFrame();
+    invalidate();
+  }
+
+  private void beginMission() {
+    mission = SpeedMissionCatalog.forIndex(missionIndex, random);
+    missionEngine.start(mission);
+    timeLeft = mission.baseSeconds + carrySeconds;
+    carrySeconds = 0;
+    highestDifficulty = Math.max(highestDifficulty, mission.difficulty);
+    speedStreak = 0;
+    speedLastSide = -1;
+  }
+
+  private void handleSpeedTap(int side) {
+    speedTaps++;
+    speedStreak = speedLastSide == -1 || speedLastSide != side ? speedStreak + 1 : 1;
+    speedLastSide = side;
+    speedBestStreak = Math.max(speedBestStreak, speedStreak);
+    SpeedMissionEngine.TapResult result = missionEngine.tap(side);
+    if (result == SpeedMissionEngine.TapResult.FAILED) {
+      showToast("Pattern broken", .55f);
+      timeLeft = 0;
+      return;
     }
-
-    private String boredomLabel(){
-        long n=state.todayTaps;
-        if(n<20)return "یه کم بیکار";
-        if(n<100)return "حوصله‌ت سر رفته";
-        if(n<500)return "خیلی بیکار";
-        if(n<2000)return "رسماً هیچ کاری نداری";
-        return "استاد اعظم بیکاری";
+    if (result == SpeedMissionEngine.TapResult.COMPLETE) {
+      completedMissions++;
+      carrySeconds = Math.min(MAX_CARRY_SECONDS, Math.max(0, timeLeft));
+      maxCarry = Math.max(maxCarry, carrySeconds);
+      unlockSpeedAchievements();
+      if (mission.type == SpeedMission.Type.ALTERNATE) prefs.unlock("perfect_alternation");
+      if (maxCarry >= 10) prefs.unlock("carry_master");
+      missionIndex++;
+      successPause = .48f;
+      confetti(18);
+      haptic(3);
     }
+  }
 
-    private String percentileJoke(){
-        long n=state.todayTaps;
-        int pct=(int)Math.min(99,45+Math.log10(Math.max(1,n))*18);
-        return "طبق آمار کاملاً الکی: از "+pct+"٪ مردم بیکارتری 😌";
+  private void finishSpeedSession() {
+    int score = completedMissions * 100 + speedTaps + highestDifficulty * 10;
+    lastResult =
+        new GameRecord(
+            "SPEED",
+            score,
+            completedMissions,
+            speedTaps,
+            (long) (sessionSeconds * 1000),
+            prefs.skin(),
+            System.currentTimeMillis(),
+            highestDifficulty,
+            maxCarry);
+    prefs.saveRecord(lastResult);
+    prefs.flush();
+    screen = Screen.RESULTS;
+    updateSensorRegistration();
+    removeFrame();
+    invalidate();
+  }
+
+  private void unlockSpeedAchievements() {
+    if (completedMissions >= 1) prefs.unlock("speed_first");
+    if (completedMissions >= 5) prefs.unlock("speed_5");
+    if (completedMissions >= 10) prefs.unlock("speed_10");
+    if (completedMissions >= 20) prefs.unlock("speed_20");
+  }
+
+  private void checkTapAchievements() {
+    for (long target : GamePreferences.TAP_ACHIEVEMENTS)
+      if (prefs.totalTaps() >= target && !prefs.achievement(String.valueOf(target))) {
+        prefs.unlock(String.valueOf(target));
+        showToast("Achievement unlocked", 1.7f);
+        confetti(24);
+        haptic(3);
+        break;
+      }
+  }
+
+  private void playTap() {
+    GameModeConfig mode = GameModeConfig.forId(prefs.mode());
+    long now = System.currentTimeMillis();
+    if (!prefs.sound() || mode.silent || tone == null || now - lastSoundMs < 65) return;
+    lastSoundMs = now;
+    try {
+      tone.startTone(ToneGenerator.TONE_PROP_BEEP, 22);
+    } catch (RuntimeException ignored) {
     }
+  }
 
-    private String shareText(){
-        return "کارنامه بیکاری من 😂\nامروز: "+state.todayTaps+" ضربه\nکل: "+state.totalTaps+"\nبهترین رگبار: "+state.bestStreak+"\n"+percentileJoke()+"\n#بیکارم";
+  private void playCollision() {
+    GameModeConfig mode = GameModeConfig.forId(prefs.mode());
+    long now = System.currentTimeMillis();
+    if (!prefs.sound() || mode.silent || tone == null || now - lastSoundMs < 110) return;
+    lastSoundMs = now;
+    try {
+      tone.startTone(ToneGenerator.TONE_PROP_NACK, 35);
+    } catch (RuntimeException ignored) {
     }
+  }
 
-    private void showToast(String s,long duration){toast=s; toastUntil=System.currentTimeMillis()+duration;}
-
-    private void drawPill(Canvas c,float l,float t,float r,float h,String s,int color){
-        RectF box=new RectF(l,t,r,t+h); p.setColor(color); c.drawRoundRect(box,h/2,h/2,p); text.setTextAlign(Paint.Align.CENTER); text.setTextSize(sp(11.5f)); text.setColor(Color.rgb(45,45,45)); c.drawText(s,box.centerX(),box.centerY()+dp(4),text);
+  private void haptic(int kind) {
+    if (!prefs.haptics()
+        || vibrator == null
+        || !vibrator.hasVibrator()
+        || GameModeConfig.forId(prefs.mode()).silent) return;
+    int amplitude = kind == 3 ? 85 : kind == 2 ? 62 : 38;
+    long duration = kind == 3 ? 18 : kind == 2 ? 12 : 7;
+    try {
+      vibrator.vibrate(VibrationEffect.createOneShot(duration, amplitude));
+    } catch (RuntimeException ignored) {
     }
+  }
 
-    private float dist(float x1,float y1,float x2,float y2){float dx=x1-x2,dy=y1-y2;return(float)Math.sqrt(dx*dx+dy*dy);}
-    private float dp(float v){return v*density;}
-    private float sp(float v){return v*getResources().getDisplayMetrics().scaledDensity;}
-
-    @Override public void onSensorChanged(SensorEvent event) {
-        if(event.sensor.getType()==Sensor.TYPE_ACCELEROMETER) tiltX = tiltX*.82f + (-event.values[0])*.18f;
+  private void confetti(int count) {
+    if (prefs.reducedMotion()) count = Math.min(8, count);
+    int[] colors = {
+      Color.rgb(237, 80, 72),
+      ACCENT,
+      Color.rgb(66, 145, 220),
+      Color.rgb(72, 177, 116),
+      Color.rgb(161, 93, 211)
+    };
+    for (int i = 0; i < count && particles.size() < 100; i++) {
+      Particle q = new Particle();
+      q.x = getWidth() / 2f;
+      q.y = getHeight() * .35f;
+      q.vx = (random.nextFloat() - .5f) * dp(360);
+      q.vy = -random.nextFloat() * dp(350) - dp(70);
+      q.life = .7f + random.nextFloat();
+      q.color = colors[i % colors.length];
+      particles.add(q);
     }
-    @Override public void onAccuracyChanged(Sensor sensor,int accuracy) {}
+    requestFrame();
+  }
+
+  private void updateSensorRegistration() {
+    boolean should =
+        hostActive
+            && prefs.deviceGravity()
+            && (screen == Screen.GAME || screen == Screen.SPEED)
+            && accelerometer != null;
+    if (should && !sensorRegistered)
+      sensorRegistered =
+          sensorManager.registerListener(this, accelerometer, SensorManager.SENSOR_DELAY_GAME);
+    else if (!should) unregisterSensor();
+  }
+
+  private void unregisterSensor() {
+    if (sensorRegistered) sensorManager.unregisterListener(this);
+    sensorRegistered = false;
+    tiltX = 0;
+  }
+
+  @Override
+  public void onSensorChanged(SensorEvent e) {
+    if (e.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+      tiltX = tiltX * .84f + (-e.values[0]) * .16f;
+      requestFrame();
+    }
+  }
+
+  @Override
+  public void onAccuracyChanged(Sensor sensor, int accuracy) {}
+
+  private void button(Canvas c, float l, float t, float r, float b, String value, boolean primary) {
+    rect.set(l, t, r, b);
+    paint.setColor(primary ? INK : Color.argb(155, 255, 255, 255));
+    c.drawRoundRect(rect, dp(18), dp(18), paint);
+    label(
+        c,
+        value,
+        rect.centerX(),
+        rect.centerY() + dp(5),
+        14,
+        primary ? Color.WHITE : INK,
+        Paint.Align.CENTER);
+  }
+
+  private void chip(Canvas c, float l, float t, float r, float b, String value, boolean selected) {
+    rect.set(l, t, r, b);
+    paint.setColor(selected ? INK : Color.argb(135, 255, 255, 255));
+    c.drawRoundRect(rect, dp(12), dp(12), paint);
+    label(
+        c,
+        value,
+        rect.centerX(),
+        rect.centerY() + dp(4),
+        9,
+        selected ? Color.WHITE : MUTED,
+        Paint.Align.CENTER);
+  }
+
+  private void progress(Canvas c, float l, float t, float r, float b, float value, int color) {
+    rect.set(l, t, r, b);
+    paint.setColor(Color.argb(34, 0, 0, 0));
+    c.drawRoundRect(rect, dp(5), dp(5), paint);
+    rect.right = l + (r - l) * Math.max(0, Math.min(1, value));
+    paint.setColor(color);
+    c.drawRoundRect(rect, dp(5), dp(5), paint);
+  }
+
+  private void overlay(Canvas c, String title, String subtitle) {
+    rect.set(dp(35), getHeight() * .39f, getWidth() - dp(35), getHeight() * .57f);
+    paint.setColor(Color.argb(229, 25, 25, 24));
+    c.drawRoundRect(rect, dp(24), dp(24), paint);
+    label(c, title, rect.centerX(), rect.centerY() - dp(2), 36, Color.WHITE, Paint.Align.CENTER);
+    label(
+        c, subtitle, rect.centerX(), rect.centerY() + dp(31), 11, Color.LTGRAY, Paint.Align.CENTER);
+  }
+
+  private void drawToast(Canvas c) {
+    rect.set(dp(34), getHeight() - dp(90), getWidth() - dp(34), getHeight() - dp(40));
+    paint.setColor(Color.argb(230, 25, 25, 24));
+    c.drawRoundRect(rect, dp(17), dp(17), paint);
+    label(c, toast, rect.centerX(), rect.centerY() + dp(5), 12, Color.WHITE, Paint.Align.CENTER);
+  }
+
+  private void showToast(String value, float seconds) {
+    toast = value;
+    toastSeconds = seconds;
+    requestFrame();
+    invalidate();
+  }
+
+  private void label(
+      Canvas c, String value, float x, float y, float size, int color, Paint.Align align) {
+    text.setTextAlign(align);
+    text.setTextSize(sp(size));
+    text.setColor(color);
+    c.drawText(value, x, y, text);
+  }
+
+  private String boredomLabel() {
+    long n = prefs.todayTaps();
+    if (n < 20) return "Barely bored";
+    if (n < 100) return "Properly bored";
+    if (n < 500) return "Professionally bored";
+    if (n < 2000) return "Master of nothing";
+    return "Supreme boredom unlocked";
+  }
+
+  private int skinPreviewColor(String id) {
+    switch (id) {
+      case "FOOTBALL":
+        return Color.rgb(225, 223, 214);
+      case "COCONUT":
+        return Color.rgb(119, 76, 44);
+      case "DISCO":
+        return Color.rgb(124, 150, 182);
+      case "WATERMELON":
+        return Color.rgb(64, 153, 75);
+      case "MOON":
+        return Color.rgb(179, 183, 183);
+      case "PINGPONG":
+        return Color.rgb(244, 240, 221);
+      default:
+        return Color.rgb(188, 132, 100);
+    }
+  }
+
+  private String formatDuration(long ms) {
+    long s = Math.max(0, ms / 1000);
+    return String.format(Locale.US, "%d:%02d", s / 60, s % 60);
+  }
+
+  private float distanceSquared(float x1, float y1, float x2, float y2) {
+    float dx = x1 - x2, dy = y1 - y2;
+    return dx * dx + dy * dy;
+  }
+
+  private float dp(float v) {
+    return v * density;
+  }
+
+  private float sp(float v) {
+    return v * scaledDensity;
+  }
 }

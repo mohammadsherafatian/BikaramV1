@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- The legacy PNG is intentionally a full-bleed artwork for pre-adaptive-icon devices. -->
+    <issue id="IconLauncherShape" severity="ignore" />
+</lint>
